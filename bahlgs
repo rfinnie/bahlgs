@@ -1,0 +1,768 @@
+#!/usr/bin/perl
+
+##########################################################################
+# bahlgs, a snapshot-based backup organizer
+# Copyright (C) 2012 Ryan Finnie
+#
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
+# 02110-1301, USA.
+##########################################################################
+
+use strict;
+
+my($bahlgsver) = "2.1.0";
+my($etcdir) = "/etc/bahlgs";
+
+use Getopt::Long;
+use Pod::Usage;
+use IPC::Open3;
+use POSIX ":sys_wait_h";
+use File::Basename qw/dirname basename/;
+use File::Path qw/mkpath rmtree/;
+use File::Temp qw/tempfile/;
+use POSIX qw/strftime/;
+use File::Copy;
+
+# This is needed because $0 gets changed by us in children.
+my($my0) = $0;
+my($my0dir) = dirname($my0);
+
+my($opt_help, $opt_man, $opt_config, $opt_hostgroup);
+my($oresult) = GetOptions(
+  'help|?' => \$opt_help,
+  'man' => \$opt_man,
+  'config|c=s' => \$opt_config,
+  'hostgroup|g=s' => \$opt_hostgroup,
+);
+
+if($opt_help) {
+  pod2usage( { -message => "bahlgs version $bahlgsver" ,
+    -exitval => 2  } );
+
+}
+pod2usage(-verbose => 2) if($opt_man);
+
+my($configfile);
+if($opt_config) {
+  $configfile = $opt_config;
+  unless(-r $configfile) {
+    die("Cannot read $configfile.");
+  }
+} else {
+  $configfile = $etcdir . "/bahlgs.conf";
+}
+my(%config) = parse_config($configfile);
+
+# If arguments are present, they will be run instead of all
+# hosts in hosts_directory.
+my(@hosts);
+if(scalar @ARGV > 0) {
+  @hosts = @ARGV;
+} else {
+  @hosts = get_hosts();
+}
+
+my(@sstodel) = ();
+my(@pids) = ();
+my(%failures) = ();
+my(%pidhost) = ();
+my(%congroupcount) = ();
+my(%host_config_cache) = ();
+
+# Weed out hosts we don't need.
+my(@goodhosts) = ();
+foreach my $host (@hosts) {
+  my(%host_config) = parse_host_config($host);
+  next unless $host_config{'enabled'};
+  next if($opt_hostgroup && !($opt_hostgroup eq $host_config{'hostgroup'}));
+  push(@goodhosts, $host);
+}
+@hosts = @goodhosts;
+undef(@goodhosts);
+
+if((scalar @hosts) == 0) {
+  exit(0);
+}
+
+# This isn't really a never-ending loop.
+while(1) {
+  my(@hoststorunnow) = ();
+  my(@hostsnottorunnow) = ();
+  my($totalconleft) = ($config{'concurrent_processes'} - (scalar @pids));
+  if($totalconleft < 0) { $totalconleft = 0; }
+  foreach my $host (@hosts) {
+    # Get the hosts's config
+    my(%host_config) = parse_host_config($host);
+
+    if($totalconleft <= 0) {
+      push(@hostsnottorunnow, $host);
+      next;
+    }
+
+    if($host_config{'concurrency_group'}) {
+# XXX
+print STDERR sprintf("%s %s %s\n", $host, $host_config{'concurrency_group'}, $congroupcount{$host_config{'concurrency_group'}});
+      if($congroupcount{$host_config{'concurrency_group'}} >= 2) {
+        push(@hostsnottorunnow, $host);
+        next;
+      }
+      $congroupcount{$host_config{'concurrency_group'}}++;
+    }
+
+    push(@hoststorunnow, $host);
+    $totalconleft--;
+  }
+  @hosts = @hostsnottorunnow;
+
+  # @pids contains actively-running pids.  Make sure we always have
+  # the needed number of running processes.
+  if((scalar @hoststorunnow) > 0) {
+    # Grab a host from the beginning of the @hosts array.
+    # If the array is empty, see the else statement.
+    foreach my $host (@hoststorunnow) {
+      # Get the hosts's config
+      my(%host_config) = parse_host_config($host);
+      my($backup_directory) = $host_config{'backup_directory'};
+      my($hostname) = $host_config{'hostname'};
+      # Fork magic (there is no spoon)
+      my($pid);
+      if(!defined($pid = fork())) {
+        # Something bad happened.  Try to handle it gracefully.
+        warn "Cannot fork: $!";
+        push(@hosts, $host);
+        sleep($host_config{'failure_sleep'});
+        next;
+      } elsif($pid == 0) {
+        # THIS BLOCK RUNS THE FORKED CHILD PROCESS!
+        # Set the running title to something recognizable, then wait a
+        # random time to stagger start times.
+        $0 = "bahlgs-fork ($host)";
+        sleep(int(rand($host_config{'stagger_sleep'})));
+
+        my(@filenames);
+
+        my($ssh_options) = "";
+        my($sshconffh, $sshconf);
+        # Build ssh options
+        if($host_config{'rsync_transfer'} eq 'ssh') {
+          @filenames = ();
+          if(-f $config{'hosts_directory'} . '/default.ssh_config') {
+            push(@filenames, $config{'hosts_directory'} . '/default.ssh_config');
+          }
+          if(-f $config{'hosts_directory'} . '/' . $host . '.ssh_config') {
+            if(!$host_config{'ssh_config_append'}) {
+              @filenames = ();
+            }
+            push(@filenames, $config{'hosts_directory'} . '/' . $host . '.ssh_config');
+          }
+          if(scalar @filenames > 0) {
+            ($sshconffh, $sshconf) = tempfile();
+            foreach my $filename (@filenames) {
+              my($readbuf) = "";
+              open(SSHCONFFH, $filename);
+              read(SSHCONFFH, $readbuf, -s $filename);
+              close(SSHCONFFH);
+              print $sshconffh $readbuf;
+            }
+            $ssh_options .= " -F $sshconf";
+          }
+
+          # User-supplied command line SSH options
+          if($host_config{'ssh_options'}) { $ssh_options .= ' ' . $host_config{'ssh_options'}; }
+        }
+
+        # mkdir -p directories
+        unless(-d "$backup_directory") { mkpath("$backup_directory"); }
+        unless(-d "$backup_directory/logs") { mkpath("$backup_directory/logs"); }
+
+        # Get the last snapshot run
+        opendir(DIR, "$backup_directory");
+        my(@dirs) = sort grep { /^snapshot-/ && -d "$backup_directory/$_" } readdir(DIR);
+        closedir(DIR);
+        # Fixed 2016-10-02
+        #sort(@dirs);
+        my($lastss) = ($dirs[$#dirs] ? $dirs[$#dirs] : "");
+
+        # Time to build rsync options
+        my($rsync_options) = "--archive --verbose --numeric-ids --delete --no-blocking-io";
+
+        # Build an exclude file for rsync
+        my($excludefh, $exclude);
+        @filenames = ();
+        if(-f $config{'hosts_directory'} . '/default.excludes') {
+          push(@filenames, $config{'hosts_directory'} . '/default.excludes');
+        }
+        if(-f $config{'hosts_directory'} . '/' . $host . '.excludes') {
+          if(!$host_config{'rsync_excludes_append'}) {
+            @filenames = ();
+          }
+          push(@filenames, $config{'hosts_directory'} . '/' . $host . '.excludes');
+        }
+        if(scalar @filenames > 0) {
+          ($excludefh, $exclude) = tempfile();
+          foreach my $filename (@filenames) {
+            my($readbuf) = "";
+            open(EXCLUDEFH, $filename);
+            read(EXCLUDEFH, $readbuf, -s $filename);
+            close(EXCLUDEFH);
+            print $excludefh $readbuf;
+          }
+          $rsync_options .= " --delete-excluded --exclude-from=\"$exclude\"";
+        }
+
+        if($lastss) {
+          $rsync_options .= " --link-dest=\"$backup_directory/$lastss\"";
+        }
+
+        # User-configurable rsync options
+        if($host_config{'rsync_options'}) { $rsync_options .= " " . $host_config{'rsync_options'}; }
+
+        open(LOGFH, ">> $backup_directory/logs/working.log");
+
+        my($source);
+        if($host_config{'rsync_transfer'} eq "local") {
+          $source = $host_config{'remote_path'};
+        } elsif($host_config{'rsync_transfer'} eq "rsync") {
+          $source = "rsync://$hostname" . $host_config{'remote_path'};
+        } else {
+          $source = "$hostname:" . $host_config{'remote_path'};
+          $rsync_options .= " --rsh=\"ssh $ssh_options\"";
+        }
+
+        # The rsync process itself
+        my $rsync_commandline = $host_config{'rsync_command'} . " " . 
+          "$rsync_options \"$source\" \"$backup_directory/working/\" " . 
+          ">>\"$backup_directory/logs/working.log\" 2>&1";
+        print LOGFH "[$host] rsync process started " . strftime("%c", localtime) . "\n";
+        print LOGFH "[$host] Running: $rsync_commandline\n";
+        close(LOGFH);
+        system($rsync_commandline);
+        my($rsyncsuccessful) = 0;
+        my($rsyncrawexitstatus) = $?;
+        my($rsyncexitstatus) = $rsyncrawexitstatus >> 8;
+        open(LOGFH, ">> $backup_directory/logs/working.log");
+        print LOGFH "[$host] rsync process ended " . strftime("%c", localtime) . "\n";
+        if ($rsyncrawexitstatus == -1) {
+          print LOGFH "[$host] failed to execute: $!\n";
+          $rsyncsuccessful = 0;
+        } elsif ($rsyncrawexitstatus & 127) {
+          print LOGFH sprintf("[%s] child died with signal %d, %s coredump\n", $host,
+            ($rsyncrawexitstatus & 127),  ($rsyncrawexitstatus & 128) ? 'with' : 'without');
+          $rsyncsuccessful = 0;
+        } else {
+          print LOGFH sprintf("[%s] child exited with value %d\n", $host, $rsyncrawexitstatus >> 8);
+          # If the rsync was successful, move the working snapshot into a timed
+          # snapshot, then symlink that to "current".
+          # 24 is "some files disappeared", which is sufficient for us.
+          if(($rsyncexitstatus == 24) || ($rsyncexitstatus == 0)) {
+            $rsyncsuccessful = 1;
+          } else {
+            $rsyncsuccessful = 0;
+          }
+        }
+        close(LOGFH);
+
+        # Clean up autogenerated files
+        unlink($exclude) if($exclude);
+        unlink($sshconf) if($sshconf);
+
+        # Did the rsync process return a bad status?  If so, sleep a
+        # bit (maybe the problem will clear itself), then report a bad
+        # status back to the master bahlgs process.  If not, exit normally.
+        if($rsyncsuccessful) {
+          my($now) = strftime("%Y%m%d-%H%M", localtime);
+          move("$backup_directory/working", "$backup_directory/snapshot-$now");
+          if(-l "$backup_directory/current") { unlink("$backup_directory/current"); }
+          symlink("snapshot-$now", "$backup_directory/current");
+
+          move("$backup_directory/logs/working.log", "$backup_directory/logs/$host-$now.log");
+          if(-l "$backup_directory/logs/current.log") { unlink("$backup_directory/logs/current.log"); }
+          symlink("$host-$now.log", "$backup_directory/logs/current.log");
+
+          # Settle down after a successful run
+          sleep($host_config{'settle_sleep'});
+          exit(0);
+        } else {
+          sleep($host_config{'failure_sleep'});
+          exit(1);
+        }
+      } else {
+        # THIS BLOCK IS A CONTINUATION OF THE MASTER PROCESS!
+        # At this point, $pid contains the recently forked child.
+        # Add it to the running pids array.
+        push(@pids, $pid);
+        $pidhost{$pid} = $host;
+      }
+    }
+  }
+
+  # REAPER CODE!
+  # Constantly loop until one of our children dies.
+  my($kid) = 0;
+  do {
+    #print STDERR "Wait...\n";
+    sleep(1);
+    $kid = waitpid(-1, WNOHANG);
+  } until $kid > 0;
+  my($exitstatus) = $? >> 8;
+  my($host) = $pidhost{$kid};
+  my(%host_config) = parse_host_config($host);
+
+  if($host_config{'concurrency_group'}) {
+    $congroupcount{$host_config{'concurrency_group'}}--;
+  }
+
+  # At this point, $kid is the pid of the dead child, $exitstatus is its
+  # exit status (duh), and $host is the hostname.
+  if($exitstatus) {
+    # Was this a wrongful death?  If so, increment the host's failure counter.
+    $failures{$host}++;
+    # Transient hosts don't get retried or failures announced
+    unless($host_config{'transient'}) {
+      if($failures{$host} >= $host_config{'failure_count'}) {
+        # If there were enough failures, don't try again.
+        print STDERR "[$host] ERROR!  Run had an error.  Too many errors, giving up.  (" . $failures{$host} . ")\n";
+      } else {
+        # Fewer than enough errors?  Warn and re-queue it.
+        print STDERR "[$host] WARNING!  Run had an error.  Re-queueing.  (" . $failures{$host} . ")\n";
+        push(@hosts, $host);
+      }
+    }
+  } else {
+    # If the run was successful, get a list of snapshots to delete later.
+    push(@sstodel, cleandir($host));
+  }
+
+  # Do not simply do "delete($host)" here; we're trying to delete the
+  # hash pair, rather than the $host variable.
+  delete($pidhost{$kid});
+
+  # Delete the kid's pid out of the @pids array.
+  @pids = grep !($_ == $kid), @pids;
+
+  # Wow!  If no children are running and no hosts are left, we can exit!
+  # Wasn't that fun!
+  if(((scalar @pids) == 0) && ((scalar @hosts) == 0)) {
+    # Remove the outdated snapshots we've been collecting.
+    $0 = "bahlgs (cleaning)";
+    rmtree([@sstodel]);
+    $0 = $my0;
+    exit;
+  }
+}
+
+
+# subs below
+
+sub cleandir {
+  # This sub takes in a list of snapshots, then decides which ones to
+  # delete, if any.  The criteria to not list a snapshot is:
+  # * Must be a snapshot that was run on this first of this month, or
+  # * Must be one of the last 5 snapshots run.
+  # By this logic, a host that has been in the backup rotation for a while
+  # will have either 5 or 6 snapshots that are not deleted.
+
+  my(@todel, $mday, $mon, $year, $day1fmt, $ssbn, $lmon, $lyear, $lday1fmt);
+  my($bhost) = shift;
+  my($prerun) = shift;
+
+  my(%host_config) = parse_host_config($bhost);
+  my($backup_directory) = $host_config{'backup_directory'};
+
+  my $i = 0;
+  $i++ if($prerun);
+  opendir(DIR, "$backup_directory") || return();
+  foreach $ssbn (reverse sort readdir(DIR)) {
+    next unless $ssbn =~ /^snapshot-/;
+    $i++;
+    next if($i <= $host_config{'snapshot_save_count'});
+    if($host_config{'snapshot_save_first'}) {
+      (undef,undef,undef,$mday,$mon,$year,undef,undef,undef) = localtime(time());
+      $year += 1900;
+      $mon++;
+      my($day1fmt) = sprintf("%04d%02d%02d", $year, $mon, 1);
+      next if($ssbn =~ /snapshot-$day1fmt/);
+      if($mday == 1) {
+        $lmon = $mon;
+        $lyear = $year;
+        if($lmon == 1) { $lmon = 12; $lyear--; } else { $lmon--; }
+        $lday1fmt = sprintf("%04d%02d%02d", $lyear, $lmon, 1);
+        next if($ssbn =~ /snapshot-$lday1fmt/);
+      }
+    }
+    push(@todel, "$backup_directory/$ssbn");
+# FIX ME XXX
+#    if(-f "$backup_directory/logs/$ssbn.log") {
+#      push(@todel, "$backup_directory/logs/$ssbn.log");
+#    }
+  }
+  closedir(DIR);
+
+  return(@todel);
+}
+
+# Read in a global config.
+sub parse_config {
+  my($conffile) = shift;
+  my($key, $val);
+
+  my(%config) = (
+    'backup_base_directory' => '/var/backups/bahlgs',
+    'hosts_directory' => $etcdir . '/hosts',
+    'concurrent_processes' => 5,
+    'randomize_host_order' => 0,
+  );
+
+  open(CONFFH, $conffile) || return(%config);
+  while(my $linein = <CONFFH>) {
+    chomp $linein;
+    if($linein =~/^\s*(\w+)\s*=\s*(.*?)\s*$/) {
+      $key = $1;
+      $val = $2;
+      if(grep { $_ eq $key } keys(%config)) {
+        $config{$key} = $val;
+      }
+    }
+  }
+  close(file);
+
+  return(%config);
+}
+
+# Read in a host's config.  Hardcoded default first, then
+# default.conf, then HOST.conf.
+sub parse_host_config {
+  my($host) = shift;
+
+  if($host_config_cache{$host}) {
+    return(%{$host_config_cache{$host}});
+  }
+
+  my($key, $oper, $val);
+
+  my(%host_config) = (
+    'enabled' => 1,
+    'hostname' => $host,
+    'hostgroup' => '',
+    'ssh_options' => '',
+    'rsync_command' => 'rsync',
+    'rsync_options' => '',
+    'failure_sleep' => 300,
+    'failure_count' => 5,
+    'settle_sleep' => 5,
+    'stagger_sleep' => 15,
+    'snapshot_save_count' => 5,
+    'snapshot_save_first' => 1,
+    'remote_path' => '/',
+    'backup_directory' => ($config{'backup_base_directory'} . '/' . $host),
+    'concurrency_group' => '',
+    'ssh_config_append' => 1,
+    'rsync_excludes_append' => 1,
+    'rsync_transfer' => 'ssh',
+    'transient' => 0,
+  );
+
+  my($conffile) = $config{'hosts_directory'} . '/default.conf';
+  if(open(CONFFH, $conffile)) {
+    while(my $linein = <CONFFH>) {
+      chomp $linein;
+      if($linein =~/^\s*(\w+)\s*(=|\+=)\s*(.*?)\s*$/) {
+        $key = $1;
+        $oper = $2;
+        $val = $3;
+        if(grep { $_ eq $key } keys(%host_config)) {
+          if((grep $_ eq $key, qw/rsync_options ssh_options/) && ($oper eq '+=')) {
+            $host_config{$key} .= " $val";
+          } else {
+            $host_config{$key} = $val;
+          }
+        } else {
+          print STDERR "[$host] Unknown definition: $key$\n";
+        }
+      }
+    }
+    close(file);
+  }
+
+  my($conffile) = $config{'hosts_directory'} . '/' . $host . '.conf';
+  if(open(CONFFH, $conffile)) {
+    while(my $linein = <CONFFH>) {
+      chomp $linein;
+      if($linein =~/^\s*(\w+)\s*(=|\+=)\s*(.*?)\s*$/) {
+        $key = $1;
+        $oper = $2;
+        $val = $3;
+        if(grep { $_ eq $key } keys(%host_config)) {
+          if((grep $_ eq $key, qw/rsync_options ssh_options/) && ($oper eq '+=')) {
+            $host_config{$key} .= " $val";
+          } else {
+            $host_config{$key} = $val;
+          }
+        } else {
+          print STDERR "[$host] Unknown definition: $key$\n";
+        }
+      }
+    }
+    close(file);
+  } else {
+    print STDERR "[$host] Unknown host, skipping\n";
+    return();
+  }
+
+  $host_config_cache{$host} = \%host_config;
+  return(%host_config);
+}
+
+# Return a list of hosts, according to current config
+sub get_hosts {
+  my($hosts_directory) = $config{'hosts_directory'};
+  my(@hosts);
+  my($host);
+
+  opendir(DIR, $hosts_directory) || die("Cannot open $hosts_directory: $!");
+  my(@dirents) = grep { /\.conf$/ && -r "$hosts_directory/$host" } readdir(DIR);
+  foreach $host (@dirents) {
+    next if($host eq "default.conf");
+    $host =~ s/\.conf$//;
+    push(@hosts, $host);
+  }
+
+  if($config{'randomize_host_order'}) {
+    fisher_yates_shuffle(\@hosts);
+  } else {
+    @hosts = sort(@hosts);
+  }
+  return(@hosts);
+}
+
+# fisher_yates_shuffle( \@array ) : generate a random permutation
+# of @array in place
+sub fisher_yates_shuffle {
+    my $array = shift;
+    my $i;
+    for ($i = @$array; --$i; ) {
+        my $j = int rand ($i+1);
+        next if $i == $j;
+        @$array[$i,$j] = @$array[$j,$i];
+    }
+}
+
+__END__
+
+=head1 NAME
+
+bahlgs - A snapshot-based backup organizer
+
+=head1 SYNOPSIS
+
+bahlgs [-c /etc/bahlgs/bahlgs.conf] [-g hostgroup] [host [...]]
+
+ Options:
+   -c --config      Use a different main configuration file
+   -g --hostgroup   The hostgroup to back up
+   -? --help        Print this synposis and exit
+      --man         Open man page for this program
+
+=head1 DESCRIPTION
+
+B<bahlgs> is a snapshot-based backup scheduler and organizer.  It uses 
+rsync, and particularly rsync's link-dest option to store hard-linked 
+trees that can be browsed as any UNIX filesystem tree.  Using link-dest, 
+excess space is kept to a minimum, as only files that have been changed 
+since the backup was last run will be stored multiple times.
+
+As a practical example, say you back up a 500MB remote host on Monday.  
+On Tuesday, you run the backup again.  In that period, only one file 
+changed on the remote host, a 5MB file that decreased to 3MB.  In this 
+example, these two snapshots only take up 503MB on the disk, yet you are 
+left with two completely normal, browsable snapshot trees.
+
+=head1 ARGUMENTS
+
+=over
+
+=item B<--config>=/etc/bahlgs/bahlgs.conf
+
+Specifies an alternative hard-coded path to the main bahlgs.conf.
+
+=item B<--hostgroup>=hostgroup
+
+Specifies a hostgroup to back up.  If a hostgroup is not specified on the command line, all hosts will be processed, whether or not it's part of a hostgroup.
+
+=back
+
+=head1 CONFIGURATION
+
+=head2 bahlgs.conf
+
+bahlgs.conf is the main configuration file, and stores configuration 
+options in a "name = value" pair.  Comments may be specified with '#' or 
+';'.  All values listed are default values, and pairs may be completely 
+omitted if you do not wish to override the default.
+
+Below is a list of options that may be used in bahlgs.conf.
+
+=over
+
+=item B<hosts_directory> = /etc/bahlgs/hosts
+
+All of the host-specific configuration files go in here.
+
+=item B<backup_base_directory> = /var/backups/bahlgs
+
+The location where backup snapshots are stored.  By default, a path like 
+I<backup_base_directory>/foo.example.com/snapshot-20090101-0503 will be used for each 
+snapshot.
+
+=item B<concurrent_processes> = 5
+
+The number of concurrent backup processes that will be run.
+
+=back
+
+=head2 I<hosts_directory>/*.conf
+
+Without any command line arguments, bahlgs will use *.conf in 
+I<hosts_directory> to determine what to back up.  For example, if bahlgs finds 
+foo.example.com.conf in I<hosts_directory>, it will use its contents to back up 
+foo.example.com.  A special exception is default.conf, which, if it 
+exists, is read in prior to each host's configuration file.  The host's 
+configuration file will override default.conf on a line-by-line basis.  
+Therefore, default.conf is useful for storing configuration options 
+common to many or all of the hosts to be backed up.
+
+default.conf may be blank or omitted.  A host's .conf must exist (so 
+that speed may know what to back up), but can be blank.
+
+Below is a list of options that may be used in *.conf.
+
+=over
+
+=item B<hostname> = I<host>
+
+The hostname rsync will connect to for backing up.  If this is blank, it defaults to the host definition in the filename.  For example, a foo.example.com.conf configuration file without a I<hostname> line will back up foo.example.com.  However, if this is set, the host identifier (filename) can be anything.
+
+=item B<hostgroup> = 
+
+The hostgroup to place this host in.  hostgroups allow bahlgs to run according to different schedules.  For example, if you want a group of hosts to be run weekly, add "hostgroup = weekly" to each desired host config, then add "@weekly bahlgs --hostgroup=weekly" to your crontab.  If a hostgroup is not specified on the command line, all hostgroups will be processed.
+
+=item B<ssh_options> [+]= 
+
+Additional options to pass to ssh during the rsync connect.  There is no 
+default.  A value of "-o StrictHostKeyChecking=no -o CheckHostIP=no" 
+(minus the quotes) would disable most forms of host key checking (not 
+recommended, but sometimes necessary).
+
+=item B<rsync_command> = 
+
+The name of the rsync binary, default "rsync".
+
+=item B<rsync_options> [+]= 
+
+Additional options to pass directly to rsync.  There is no default.  Do 
+not use this option to set excludes; bahlgs has its own mechanism for 
+handling them.
+
+=item B<failure_sleep> = 300
+
+If a remote error occurs, sleep this number of seconds before 
+requeueing (see B<failure_count>).  Note that requeued hosts are simply 
+placed back at the end of the list; it could be many minutes/hours 
+before the scheduler gets back to it again.
+
+=item B<failure_count> = 5
+
+If a remote error occurs, try again after sleeping (see 
+B<failure_sleep>).  This is the total number of times a host's backup 
+will be attempted.  Note that requeued hosts are simply placed back at 
+the end of the list; it could be many minutes/hours before the 
+scheduler gets back to it again.
+
+=item B<settle_sleep> = 5
+
+The number of seconds to wait after a host has been successfully backed 
+up, before moving on to another host.  (A "settling" time.)
+
+=item B<stagger_sleep> = 15
+
+A random number of seconds, up to this value, to sleep before starting 
+the backup of a host.  This is primarily for the benefit of the 
+beginning of bahlgs's run, where N concurrent host backups starting at 
+the same moment would cause undue load on the backup host.
+
+=item B<snapshot_save_count> = 5
+
+The number of most recent snapshots to save per host.  Note that this 
+may be N + 1 depending on whether I<snapshot_save_first> is enabled, see below.
+
+=item B<snapshot_save_first> = 1
+
+Whether to save the first of the month's snapshot for each host.  A 
+value of 1 enables this option, 0 disables.  If I<snapshot_save_count> is 5 and 
+I<snapshot_save_first> is 1 (enabled), the number of snapshots saved will be: 6 
+on the first of the month (last month's first of the month snapshot, 
+plus the last 4 days, plus today), 5 on the second through fifth days of 
+the month (last 4 days, plus today), and 6 on each day for the rest of 
+the month (the first of the month, plus the last 4 days, plus today).
+
+=item B<remote_path> = /
+
+The path of the remote host to be backed up.  rsync source trailing 
+slash rules apply here; in short, it is recommended that paths always be 
+absolute, and always end with a slash.
+
+=item B<backup_directory> = I<backup_base_directory>/foo.domain.com
+
+The directory where the host's snapshots are stored.  This is normally 
+computed automatically according to I<backup_base_directory>, but may be 
+overridden on a per-host basis.  Do not use this option in default.conf.
+
+=back
+
+=head1 KEYS
+
+bahlgs will look for I<hosts_directory>/foo.example.com.key and pass it on to 
+ssh (using -i) to use RSA/DSA key-based authentication.  This is the 
+preferred (and really only viable) rsync authentication method for 
+reaching remote hosts.  If I<hosts_directory>/foo.example.com.key is not found, 
+bahlgs will fall back to I<hosts_directory>/default.key, if found.
+
+=head1 EXCLUDES
+
+When building an exclude list, bahlgs will first take the contents of 
+I<hosts_directory>/default.excludes, if found.  It will then add the contents 
+of I<hosts_directory>/foo.example.com.excludes, if found, and pass it to rsync.  
+Standard rsync filter patterns apply here.  A good starting point for 
+default.excludes is:
+
+    /proc/**
+    /tmp/**
+    /var/tmp/**
+    /sys/**
+    /dev/pts/**
+    swap
+    /var/cache/apt/archives/*.deb
+
+
+=head1 LIMITATIONS
+
+The logic for what snapshots to keep is well-documented, but fairly 
+limited.
+
+=head1 AUTHOR
+
+B<bahlgs> was written by Ryan Finnie <ryan@finnie.org>.
+
+=cut
