@@ -280,7 +280,7 @@ print STDERR sprintf("%s %s %s\n", $host, $host_config{'concurrency_group'}, $co
 
         # Did the rsync process return a bad status?  If so, sleep a
         # bit (maybe the problem will clear itself), then report a bad
-        # status back to the master bahlgs process.  If not, exit normally.
+        # status back to the main bahlgs process.  If not, exit normally.
         if($rsyncsuccessful) {
           my($now) = strftime("%Y%m%d-%H%M", localtime);
           move("$backup_directory/working", "$backup_directory/snapshot-$now");
